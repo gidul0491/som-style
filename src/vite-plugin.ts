@@ -19,14 +19,12 @@ import type { ResponsiveStyleOptions } from "./types.js";
 
 const VIRTUAL_PREFIX = "virtual:som-style-css:";
 const RESOLVED_PREFIX = "\0" + VIRTUAL_PREFIX;
-const VITE_ENTRY = "\0som-style-vite-entry";
-const VITE_SOLID = "\0som-style-vite-solid";
 
 export type TransformStaticResult = {
   code: string;
   /** Full CSS for this file's styles (tests / fallback). */
   css: string;
-  /** Deduped atoms — Vite puts these on a shared sheet. */
+  /** Deduped atoms for tests / sheet composition. */
   atoms: EmitAtom[];
 };
 
@@ -259,12 +257,13 @@ const isProjectConfigJs = (file: string): boolean => {
   );
 };
 
-const vitePackageEntry = (_root: string, runtime: "runtime" | "solid-runtime") =>
-  `export * from "som-style/${runtime}";`;
-
 /**
  * Vite plugin: static style extract + theme CSS virtual modules.
  * Prod path avoids the JS style engine when calls are static.
+ *
+ * `som-style` resolves to the real `som-style/runtime` file (not a virtual
+ * module that re-exports a bare specifier — that can white-screen in the
+ * browser when the specifier is left unresolved).
  */
 export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
   let styleConfig: LoadedStyleConfig = {
@@ -496,21 +495,25 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
       devServer.ws.send({ type: "full-reload" });
       return [];
     },
-    resolveId(id) {
-      if (id === "som-style") return VITE_ENTRY;
-      if (id === "som-style/solid") return VITE_SOLID;
+    async resolveId(id, importer, options) {
+      if (id === "som-style") {
+        return this.resolve("som-style/runtime", importer, {
+          skipSelf: true,
+          ...options,
+        });
+      }
+      if (id === "som-style/solid") {
+        return this.resolve("som-style/solid-runtime", importer, {
+          skipSelf: true,
+          ...options,
+        });
+      }
       if (id.startsWith(VIRTUAL_PREFIX) && id.endsWith(".css")) {
         return RESOLVED_PREFIX + id.slice(VIRTUAL_PREFIX.length);
       }
       return null;
     },
     load(id) {
-      if (id === VITE_ENTRY) {
-        return vitePackageEntry(root, "runtime");
-      }
-      if (id === VITE_SOLID) {
-        return vitePackageEntry(root, "solid-runtime");
-      }
       const key = keyFromResolvedId(id);
       if (key === null) return null;
       return cssByKey.get(key) ?? "";
