@@ -20,9 +20,9 @@ Solid에서 서버 렌더링(SSR)을 쓰면 `som-style/solid`를 import 하세�
 ## 설치
 
 ```bash
-pnpm add github:gidul0491/som-style
+pnpm add github:gidul0491/som-style#v0.1.0
 # 또는
-npm install github:gidul0491/som-style
+npm install github:gidul0491/som-style#v0.1.0
 ```
 
 프로젝트 루트에 `som-style/` 폴더를 만들고 스캐폴드를 복사합니다.

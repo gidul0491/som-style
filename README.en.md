@@ -20,9 +20,9 @@ For Solid SSR, import from `som-style/solid`. Otherwise use `som-style`.
 ## Install
 
 ```bash
-pnpm add github:gidul0491/som-style
+pnpm add github:gidul0491/som-style#v0.1.0
 # or
-npm install github:gidul0491/som-style
+npm install github:gidul0491/som-style#v0.1.0
 ```
 
 Create a `som-style/` folder at the project root and copy the scaffold:
