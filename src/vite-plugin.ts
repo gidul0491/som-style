@@ -1,0 +1,587 @@
+import type { Plugin, ViteDevServer, ModuleNode } from "vite";
+import { readFileSync } from "node:fs";
+import { dirname, normalize, resolve as pathResolve } from "node:path";
+import { emitStyle, type EmitAtom, type EmitStyleContext } from "./emitStyle.js";
+import { analyzeStyleCalls } from "./staticAnalyze.js";
+import {
+  loadSomStyleConfig,
+  resolveSomStyleConfigPath,
+  type LoadedStyleConfig,
+} from "./loadConfig.js";
+import {
+  collectStyleImportRefs,
+  evalAllExportedStringMaps,
+  evalExportedStyleOptions,
+} from "./resolveImports.js";
+import { expandRecipeConfig, recipeSelectionKey } from "./recipeExpand.js";
+import { transformThemeForBuild } from "./themeStatic.js";
+import type { ResponsiveStyleOptions } from "./types.js";
+
+const VIRTUAL_PREFIX = "virtual:som-style-css:";
+const RESOLVED_PREFIX = "\0" + VIRTUAL_PREFIX;
+const VITE_ENTRY = "\0som-style-vite-entry";
+const VITE_SOLID = "\0som-style-vite-solid";
+
+export type TransformStaticResult = {
+  code: string;
+  /** Full CSS for this file's styles (tests / fallback). */
+  css: string;
+  /** Deduped atoms — Vite puts these on a shared sheet. */
+  atoms: EmitAtom[];
+};
+
+type ResolveFn = (
+  id: string,
+  importer?: string
+) => Promise<string | { id: string } | null | undefined>;
+
+const loadExternalOptions = async (
+  code: string,
+  importerId: string,
+  resolve: ResolveFn
+): Promise<Map<string, ResponsiveStyleOptions>> => {
+  const map = new Map<string, ResponsiveStyleOptions>();
+  const refs = collectStyleImportRefs(code);
+  if (refs.length === 0) return map;
+
+  for (const ref of refs) {
+    const resolved = await resolve(ref.source, importerId);
+    const resolvedId =
+      typeof resolved === "string" ? resolved : resolved?.id ?? null;
+    if (!resolvedId) continue;
+    const filePath = normalize(resolvedId.split("?")[0] ?? resolvedId);
+    if (filePath.includes("node_modules")) continue;
+
+    let source: string;
+    try {
+      source = readFileSync(filePath, "utf8");
+    } catch {
+      continue;
+    }
+
+    const options = evalExportedStyleOptions(source, ref.imported);
+    if (options) map.set(ref.local, options);
+  }
+
+  return map;
+};
+
+/** Load string token maps from relative imports (project constant.js — any export name). */
+const loadTokenMaps = async (
+  code: string,
+  importerId: string,
+  resolve: ResolveFn,
+  watchFile?: (id: string) => void
+): Promise<Map<string, Record<string, string>>> => {
+  const map = new Map<string, Record<string, string>>();
+  const refs = collectStyleImportRefs(code);
+  if (refs.length === 0) return map;
+
+  const readLocal = (filePath: string): string | null => {
+    try {
+      return readFileSync(filePath, "utf8");
+    } catch {
+      return null;
+    }
+  };
+
+  for (const ref of refs) {
+    let filePath: string | null = null;
+    let source: string | null = null;
+
+    // Prefer path resolve — Vite this.resolve often fails for sibling ./ files here.
+    if (ref.source.startsWith(".")) {
+      filePath = normalize(pathResolve(dirname(importerId), ref.source));
+      source = readLocal(filePath);
+    }
+
+    if (source == null) {
+      const resolved = await resolve(ref.source, importerId);
+      const resolvedId =
+        typeof resolved === "string" ? resolved : resolved?.id ?? null;
+      if (!resolvedId) continue;
+      filePath = normalize(resolvedId.split("?")[0] ?? resolvedId);
+      if (filePath.includes("node_modules")) continue;
+      source = readLocal(filePath);
+    }
+
+    if (source == null || filePath == null) continue;
+    if (filePath.includes("node_modules")) continue;
+
+    watchFile?.(filePath);
+    const exported = evalAllExportedStringMaps(source);
+    const table = exported.get(ref.imported);
+    if (table) map.set(ref.local, table);
+  }
+
+  return map;
+};
+
+const emitRecipeLookupExpr = (
+  classMap: Record<string, string>,
+  defaults: Record<string, string>
+): string => {
+  const fallbackKey = recipeSelectionKey(defaults);
+  return `((__p={})=>{const __d=${JSON.stringify(defaults)};const __s={...__d,...__p};const __k=Object.keys(__s).filter((k)=>__s[k]!=null&&__s[k]!=="").sort().map((k)=>k+"="+__s[k]).join("|");const __m=${JSON.stringify(classMap)};return __m[__k]||__m[${JSON.stringify(fallbackKey)}]||Object.values(__m)[0]||"";})`;
+};
+
+/** Keep `.className` / string coercion after static extract (bare strings break `.className`). */
+const emitStaticHandleExpr = (className: string): string =>
+  `Object.assign(Object(${JSON.stringify(className)}),{className:${JSON.stringify(className)}})`;
+
+/**
+ * Replaces static style(), variants(), recipe(), and same-file .extend() with
+ * class-name strings / maps / lookups; emits CSS. Throws on dynamic args.
+ */
+export const transformForBuild = (
+  code: string,
+  fileId: string,
+  ctx: EmitStyleContext,
+  externalOptions?: Map<string, ResponsiveStyleOptions>,
+  tokenMaps?: Map<string, Record<string, string>>
+): TransformStaticResult => {
+  const hits = analyzeStyleCalls(code, { externalOptions, tokenMaps });
+  if (hits.length === 0) {
+    return { code, css: "", atoms: [] };
+  }
+
+  for (const hit of hits) {
+    if (hit.kind === "dynamic") {
+      throw new Error(
+        `[som-style] ${fileId}: static extraction failed. ${hit.error ?? "Use a static style() / variants() / recipe() / .extend({ ... }) literal."}`.trim()
+      );
+    }
+  }
+
+  const cssParts: string[] = [];
+  let next = code;
+  const atomById = new Map<string, { id: string; css: string }>();
+
+  const collectAtoms = (atoms: { id: string; css: string }[]) => {
+    for (const atom of atoms) {
+      if (!atomById.has(atom.id)) atomById.set(atom.id, atom);
+    }
+  };
+
+  const staticHits = [...hits].sort((a, b) => b.start - a.start);
+  for (const hit of staticHits) {
+    if (hit.kind === "variants" && hit.variantMap) {
+      const entries: string[] = [];
+      for (const [key, options] of Object.entries(hit.variantMap)) {
+        const emitted = emitStyle(options, ctx);
+        collectAtoms(emitted.atoms);
+        entries.push(
+          `${JSON.stringify(key)}:${emitStaticHandleExpr(emitted.className)}`
+        );
+      }
+      next =
+        next.slice(0, hit.start) +
+        `({${entries.join(",")}})` +
+        next.slice(hit.end);
+      continue;
+    }
+
+    if (hit.kind === "recipe" && hit.recipeConfig) {
+      const expanded = expandRecipeConfig(hit.recipeConfig);
+      const classMap: Record<string, string> = {};
+      for (const entry of expanded.entries) {
+        const emitted = emitStyle(entry.options, ctx);
+        collectAtoms(emitted.atoms);
+        classMap[entry.key] = emitted.className;
+      }
+      next =
+        next.slice(0, hit.start) +
+        emitRecipeLookupExpr(classMap, expanded.defaults) +
+        next.slice(hit.end);
+      continue;
+    }
+
+    const emitted = emitStyle(hit.options!, ctx);
+    collectAtoms(emitted.atoms);
+    next =
+      next.slice(0, hit.start) +
+      emitStaticHandleExpr(emitted.className) +
+      next.slice(hit.end);
+  }
+
+  // Base atoms first, then media — prevents later base rules from beating earlier @media.
+  const css = composeAtomCss([...atomById.values()]);
+
+  return { code: next, css, atoms: [...atomById.values()] };
+};
+
+/** Stable shared-sheet CSS: base rules, then @media (atomic dedupe by id). */
+export const composeAtomCss = (atoms: EmitAtom[]): string => {
+  const baseAtoms: string[] = [];
+  const mediaAtoms: string[] = [];
+  const seen = new Set<string>();
+  for (const atom of atoms) {
+    if (seen.has(atom.id)) continue;
+    seen.add(atom.id);
+    if (atom.css.startsWith("@media")) mediaAtoms.push(atom.css);
+    else baseAtoms.push(atom.css);
+  }
+  return [...baseAtoms, ...mediaAtoms].join("\n");
+};
+
+export type SomStylePluginOptions = {
+  configFile?: string;
+};
+
+const toVirtualImport = (key: string) => `${VIRTUAL_PREFIX}${key}.css`;
+
+const toResolvedId = (key: string) => `${RESOLVED_PREFIX}${key}.css`;
+
+const keyFromResolvedId = (resolvedId: string): string | null => {
+  if (!resolvedId.startsWith(RESOLVED_PREFIX)) return null;
+  let key = resolvedId.slice(RESOLVED_PREFIX.length);
+  if (key.endsWith(".css")) key = key.slice(0, -4);
+  return key;
+};
+
+/** Windows-safe path compare (Vite often uses `/`, Node `normalize` uses `\`). */
+const canonPath = (p: string): string =>
+  normalize(p.split("?")[0] ?? p)
+    .replace(/\\/g, "/")
+    .toLowerCase();
+
+const isProjectConstantJs = (file: string): boolean =>
+  /\/som-style\/constant\.[cm]?js$/.test(canonPath(file));
+
+const isProjectThemeJs = (file: string): boolean =>
+  /\/som-style\/theme\.[cm]?[jt]s$/.test(canonPath(file));
+
+const isProjectConfigJs = (file: string): boolean => {
+  const p = canonPath(file);
+  return (
+    /\/som-style\/config\.[cm]?[jt]s$/.test(p) ||
+    /\/som-style\.config\.[cm]?[jt]s$/.test(p)
+  );
+};
+
+const vitePackageEntry = (_root: string, runtime: "runtime" | "solid-runtime") =>
+  `export * from "som-style/${runtime}";`;
+
+/**
+ * Vite plugin: static style extract + theme CSS virtual modules.
+ * Prod path avoids the JS style engine when calls are static.
+ */
+export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
+  let styleConfig: LoadedStyleConfig = {
+    breakpoints: { pc: "1024px" },
+    classPrefix: "som",
+    breakpoint: "1024px",
+  };
+  let root = process.cwd();
+  let server: ViteDevServer | undefined;
+  const cssByKey = new Map<string, string>();
+  /** canon(token file) → canon(consumer module paths) */
+  const tokenFileConsumers = new Map<string, Set<string>>();
+
+  const invalidateVirtualCss = (key: string) => {
+    if (!server) return;
+    const id = toResolvedId(key);
+    const mod = server.moduleGraph.getModuleById(id);
+    if (!mod) return;
+    server.moduleGraph.invalidateModule(mod);
+  };
+
+  const applyExtractedCss = (
+    consumerKey: string,
+    themeCss: string,
+    styleResult: TransformStaticResult,
+    importKeys: { filePath: string; normalizedId: string }
+  ): string => {
+    const fileCss = [themeCss, styleResult.css].filter(Boolean).join("\n");
+    const keys = [
+      consumerKey,
+      encodeURIComponent(importKeys.filePath),
+      encodeURIComponent(importKeys.normalizedId),
+    ];
+    for (const key of keys) {
+      if (fileCss) cssByKey.set(key, fileCss);
+      else cssByKey.delete(key);
+      invalidateVirtualCss(key);
+    }
+    if (!fileCss) return styleResult.code;
+    return `import "${toVirtualImport(consumerKey)}";\n${styleResult.code}`;
+  };
+
+  const trackTokenConsumer = (tokenFile: string, consumerId: string) => {
+    const file = canonPath(tokenFile);
+    const consumer = canonPath(consumerId);
+    let set = tokenFileConsumers.get(file);
+    if (!set) {
+      set = new Set();
+      tokenFileConsumers.set(file, set);
+    }
+    set.add(consumer);
+  };
+
+  const findGraphModules = (
+    devServer: ViteDevServer,
+    consumerCanon: string
+  ): ModuleNode[] => {
+    const out: ModuleNode[] = [];
+    for (const mod of devServer.moduleGraph.idToModuleMap.values()) {
+      const id = mod.id ? canonPath(mod.id) : "";
+      const file = mod.file ? canonPath(mod.file) : "";
+      if (id === consumerCanon || file === consumerCanon) out.push(mod);
+    }
+    return out;
+  };
+
+  const collectConsumersForTokenChange = (
+    file: string,
+    modules: ModuleNode[]
+  ): Set<string> => {
+    const fileCanon = canonPath(file);
+    const consumers = new Set<string>();
+
+    for (const [tokenPath, set] of tokenFileConsumers) {
+      if (tokenPath === fileCanon) {
+        for (const c of set) consumers.add(c);
+      }
+    }
+
+    // Path map miss (slash/casing) — still treat project constant.js as hot
+    if (consumers.size === 0 && (isProjectConstantJs(file) || isProjectThemeJs(file))) {
+      for (const set of tokenFileConsumers.values()) {
+        for (const c of set) consumers.add(c);
+      }
+    }
+
+    for (const mod of modules) {
+      for (const importer of mod.importers) {
+        if (importer.id) consumers.add(canonPath(importer.id));
+        if (importer.file) consumers.add(canonPath(importer.file));
+      }
+    }
+
+    return consumers;
+  };
+
+  /** Re-read tokens + re-extract CSS into cssByKey before full-reload. */
+  const reextractConsumer = async (
+    consumerCanon: string,
+    resolve: ResolveFn
+  ): Promise<void> => {
+    // Prefer real filesystem path from the module graph
+    let filePath: string | null = null;
+    if (server) {
+      for (const mod of findGraphModules(server, consumerCanon)) {
+        if (mod.file) {
+          filePath = mod.file;
+          break;
+        }
+      }
+    }
+    if (!filePath) {
+      // consumerCanon is like c:/git/.../main.js
+      filePath = consumerCanon;
+    }
+
+    let source: string;
+    try {
+      source = readFileSync(filePath, "utf8");
+    } catch {
+      return;
+    }
+    if (!/\bstyle\s*\(/.test(source) && !/\bdefineTheme\s*\(/.test(source)) {
+      return;
+    }
+
+    const normalizedId = normalize(filePath);
+    const themeResult = transformThemeForBuild(source, filePath);
+    const tokenMaps = await loadTokenMaps(
+      themeResult.code,
+      normalizedId,
+      resolve,
+      (tokenFile) => {
+        trackTokenConsumer(tokenFile, normalizedId);
+      }
+    );
+    const styleResult = transformForBuild(
+      themeResult.code,
+      filePath,
+      styleConfig,
+      undefined,
+      tokenMaps
+    );
+    const consumerKey = encodeURIComponent(filePath);
+    applyExtractedCss(consumerKey, themeResult.css, styleResult, {
+      filePath,
+      normalizedId,
+    });
+  };
+
+  return {
+    name: "som-style",
+    enforce: "pre",
+    configResolved(config) {
+      root = config.root;
+    },
+    configureServer(devServer) {
+      server = devServer;
+    },
+    async buildStart() {
+      const configPath = await resolveSomStyleConfigPath(root, opts.configFile);
+      if (configPath) this.addWatchFile(configPath);
+      styleConfig = await loadSomStyleConfig(root, opts.configFile);
+      cssByKey.clear();
+      tokenFileConsumers.clear();
+    },
+    async handleHotUpdate({ file, modules, server: devServer }) {
+      if (isProjectConfigJs(file)) {
+        styleConfig = await loadSomStyleConfig(root, opts.configFile);
+        cssByKey.clear();
+        const rootCanon = canonPath(root);
+        for (const mod of [...devServer.moduleGraph.idToModuleMap.values()]) {
+          const id = mod.id ?? "";
+          const modFile = mod.file ?? "";
+          const underRoot =
+            modFile &&
+            canonPath(modFile).startsWith(rootCanon) &&
+            !modFile.includes("node_modules");
+          if (
+            id.includes(VIRTUAL_PREFIX) ||
+            id.startsWith(RESOLVED_PREFIX) ||
+            underRoot
+          ) {
+            devServer.moduleGraph.invalidateModule(mod);
+          }
+        }
+        for (const mod of modules) {
+          devServer.moduleGraph.invalidateModule(mod);
+        }
+        devServer.ws.send({ type: "full-reload" });
+        return [];
+      }
+
+      const fileCanon = canonPath(file);
+      const tracked =
+        tokenFileConsumers.has(fileCanon) ||
+        isProjectConstantJs(file) ||
+        isProjectThemeJs(file) ||
+        modules.some(
+          (m) =>
+            (m.file &&
+              (isProjectConstantJs(m.file) || isProjectThemeJs(m.file))) ||
+            (m.id && (isProjectConstantJs(m.id) || isProjectThemeJs(m.id)))
+        );
+
+      if (!tracked) return;
+
+      const consumers = collectConsumersForTokenChange(file, modules);
+      const resolve: ResolveFn = async (source, importer) => {
+        const result = await devServer.pluginContainer.resolveId(
+          source,
+          importer
+        );
+        return result;
+      };
+
+      for (const consumer of consumers) {
+        await reextractConsumer(consumer, resolve);
+        for (const mod of findGraphModules(devServer, consumer)) {
+          devServer.moduleGraph.invalidateModule(mod);
+        }
+      }
+
+      for (const mod of modules) {
+        devServer.moduleGraph.invalidateModule(mod);
+      }
+
+      // Hashed class names in JS must refresh with CSS.
+      devServer.ws.send({ type: "full-reload" });
+      return [];
+    },
+    resolveId(id) {
+      if (id === "som-style") return VITE_ENTRY;
+      if (id === "som-style/solid") return VITE_SOLID;
+      if (id.startsWith(VIRTUAL_PREFIX) && id.endsWith(".css")) {
+        return RESOLVED_PREFIX + id.slice(VIRTUAL_PREFIX.length);
+      }
+      return null;
+    },
+    load(id) {
+      if (id === VITE_ENTRY) {
+        return vitePackageEntry(root, "runtime");
+      }
+      if (id === VITE_SOLID) {
+        return vitePackageEntry(root, "solid-runtime");
+      }
+      const key = keyFromResolvedId(id);
+      if (key === null) return null;
+      return cssByKey.get(key) ?? "";
+    },
+    async transform(code, id) {
+      const normalizedId = normalize(id.split("?")[0] ?? id);
+      const normalizedRoot = normalize(root);
+      if (!normalizedId.startsWith(normalizedRoot)) return null;
+      if (
+        !/\.[cm]?[jt]sx?$/.test(normalizedId) ||
+        normalizedId.includes("node_modules")
+      ) {
+        return null;
+      }
+      if (
+        !/\bstyle\s*\(/.test(code) &&
+        !/\.extend\s*\(/.test(code) &&
+        !/\bvariants\s*\(/.test(code) &&
+        !/\brecipe\s*\(/.test(code) &&
+        !/\bdefineTheme\s*\(/.test(code)
+      ) {
+        return null;
+      }
+
+      try {
+        const resolve: ResolveFn = async (source, importer) => {
+          const result = await this.resolve(source, importer, {
+            skipSelf: true,
+          });
+          return result;
+        };
+        const themeResult = transformThemeForBuild(code, id);
+        const externalOptions = await loadExternalOptions(
+          themeResult.code,
+          normalizedId,
+          resolve
+        );
+        const tokenMaps = await loadTokenMaps(
+          themeResult.code,
+          normalizedId,
+          resolve,
+          (filePath) => {
+            this.addWatchFile(filePath);
+            trackTokenConsumer(filePath, normalizedId);
+          }
+        );
+        const styleResult = transformForBuild(
+          themeResult.code,
+          id,
+          styleConfig,
+          externalOptions,
+          tokenMaps
+        );
+        const consumerKey = encodeURIComponent(id);
+        const out = applyExtractedCss(
+          consumerKey,
+          themeResult.css,
+          styleResult,
+          { filePath: id, normalizedId }
+        );
+        if (out === styleResult.code && !themeResult.css && styleResult.atoms.length === 0) {
+          return { code: styleResult.code, map: null };
+        }
+        return { code: out, map: null };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.error(message);
+        return null;
+      }
+    },
+  };
+}
+
+export default somStyle;

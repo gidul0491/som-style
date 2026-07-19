@@ -1,0 +1,251 @@
+import type { ResponsiveStyleOptions, StyleObject } from "./types.js";
+
+export type EmitStyleContext = {
+  breakpoints: Record<string, string>;
+  classPrefix: string;
+  breakpoint: string;
+};
+
+export type EmitAtom = {
+  id: string;
+  css: string;
+};
+
+export type EmitStyleResult = {
+  /** Space-separated class names (atoms + optional nested compound). */
+  className: string;
+  /** CSS for all atoms/compounds used by this style (may overlap other emits). */
+  css: string;
+  styleKey: string;
+  atoms: EmitAtom[];
+};
+
+export const hash = (str: string) => {
+  let h = 5381;
+  let i = str.length;
+  while (i) h = (h * 33) ^ str.charCodeAt(--i);
+  return (h >>> 0).toString(36);
+};
+
+const camelToKebab = (str: string) =>
+  str.replace(/([A-Z])/g, "-$1").toLowerCase();
+
+/** Collapse whitespace so multiline template literals still emit valid CSS. */
+const cssValue = (value: string | number): string =>
+  typeof value === "number"
+    ? String(value)
+    : value.replace(/\s+/g, " ").trim();
+
+const bpToken = (key: string) => {
+  const t = key.trim().replace(/[^a-zA-Z0-9_-]+/g, "");
+  return t || "bp";
+};
+
+const splitFlatAndNested = (style: StyleObject) => {
+  const flat: Record<string, string | number> = {};
+  const nested: Record<string, StyleObject> = {};
+
+  for (const [key, value] of Object.entries(style)) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === "object" && !Array.isArray(value)) {
+      nested[key] = value as StyleObject;
+    } else {
+      flat[key] = value as string | number;
+    }
+  }
+
+  return { flat, nested };
+};
+
+/** Nested selectors (&:hover, descendants) stay as one compound class. */
+const processNestedObject = (
+  style: StyleObject,
+  className: string,
+  selectorPrefix = ""
+) => {
+  let mainRules = "";
+  let extraRules = "";
+
+  Object.entries(style).forEach(([key, value]) => {
+    if (value === undefined || value === null) return;
+
+    if (typeof value === "object" && !Array.isArray(value)) {
+      const subSelector = key.includes("&")
+        ? key.replace("&", `.${className}`)
+        : `.${className} ${key}`;
+      const processed = processNestedObject(value, className, subSelector);
+      extraRules += processed.mainRules + processed.extraRules;
+    } else {
+      mainRules += `${camelToKebab(key)}:${cssValue(value as string | number)};`;
+    }
+  });
+
+  if (selectorPrefix && mainRules) {
+    return { mainRules: `${selectorPrefix} { ${mainRules} }`, extraRules };
+  }
+  return { mainRules, extraRules };
+};
+
+const parsePxNumeric = (val: string): number => {
+  const num = parseFloat(val);
+  if (isNaN(num)) return 0;
+  if (val.endsWith("rem") || val.endsWith("em")) return num * 16;
+  return num;
+};
+
+const isValidCssLength = (val: string): boolean => {
+  return /^\d+(\.\d+)?(px|rem|em|vw|vh|%|vmin|vmax)$/i.test(val.trim());
+};
+
+const makeAtom = (
+  prefix: string,
+  bpKey: string | null,
+  prop: string,
+  value: string | number,
+  mediaMinWidth: string | null
+): EmitAtom => {
+  const kebab = camelToKebab(prop);
+  const normalized = cssValue(value);
+  const core = hash(`${kebab}:${normalized}`);
+  const id = bpKey
+    ? `${prefix}-${bpToken(bpKey)}-${core}`
+    : `${prefix}-${core}`;
+  const decl = `.${id}{${kebab}:${normalized};}`;
+  const css = mediaMinWidth
+    ? `@media (min-width: ${mediaMinWidth}){${decl}}`
+    : decl;
+  return { id, css };
+};
+
+const makeNestedCompound = (
+  prefix: string,
+  bpKey: string | null,
+  nested: StyleObject,
+  mediaMinWidth: string | null
+): EmitAtom | null => {
+  if (Object.keys(nested).length === 0) return null;
+
+  const nestHash = hash(JSON.stringify({ nested, bpKey }));
+  const id = bpKey
+    ? `${prefix}-${bpToken(bpKey)}-n${nestHash}`
+    : `${prefix}-n${nestHash}`;
+  const processed = processNestedObject(nested, id);
+  const body = `${processed.mainRules}${processed.extraRules}`.trim();
+  if (!body) return null;
+
+  const css = mediaMinWidth
+    ? `@media (min-width: ${mediaMinWidth}){${body}}`
+    : body;
+  return { id, css };
+};
+
+type ResolvedBreakpoint = {
+  key: string;
+  bpValue: string;
+  numValue: number;
+  style: StyleObject;
+};
+
+const resolveBreakpoints = (
+  bpStyles: Record<string, StyleObject | undefined>,
+  ctx: EmitStyleContext
+): ResolvedBreakpoint[] =>
+  Object.entries(bpStyles)
+    .filter(([_, style]) => style && Object.keys(style).length > 0)
+    .map(([key, style]) => {
+      let bpValue = ctx.breakpoints[key];
+      if (!bpValue) {
+        if (isValidCssLength(key)) {
+          bpValue = key;
+        } else {
+          console.warn(
+            `[som-style] Unknown breakpoint "${key}". Expected a configured name (e.g. "pc") or valid CSS length (e.g. "768px"). Falling back to default pc breakpoint (${ctx.breakpoint}).`
+          );
+          bpValue = ctx.breakpoint;
+        }
+      }
+      return {
+        key,
+        bpValue,
+        numValue: parsePxNumeric(bpValue),
+        style: style!,
+      };
+    })
+    .sort((a, b) => a.numValue - b.numValue);
+
+const emitLayer = (
+  style: StyleObject,
+  ctx: EmitStyleContext,
+  bpKey: string | null,
+  mediaMinWidth: string | null,
+  atoms: EmitAtom[],
+  classList: string[]
+) => {
+  const { flat, nested } = splitFlatAndNested(style);
+
+  for (const prop of Object.keys(flat).sort()) {
+    const atom = makeAtom(ctx.classPrefix, bpKey, prop, flat[prop], mediaMinWidth);
+    atoms.push(atom);
+    classList.push(atom.id);
+  }
+
+  const compound = makeNestedCompound(
+    ctx.classPrefix,
+    bpKey,
+    nested,
+    mediaMinWidth
+  );
+  if (compound) {
+    atoms.push(compound);
+    classList.push(compound.id);
+  }
+};
+
+/**
+ * Atomic CSS emission shared by runtime and the Vite build plugin.
+ * Flat declarations become reusable atoms (with breakpoint prefixes when needed).
+ * Nested selectors remain a compound class.
+ */
+export const emitStyle = (
+  options: ResponsiveStyleOptions,
+  ctx: EmitStyleContext
+): EmitStyleResult => {
+  const styleKey = JSON.stringify({
+    options,
+    bpMap: ctx.breakpoints,
+    prefix: ctx.classPrefix,
+  });
+
+  const { base, ...bpStyles } = options;
+  const atoms: EmitAtom[] = [];
+  const classList: string[] = [];
+
+  emitLayer(base || {}, ctx, null, null, atoms, classList);
+
+  for (const bp of resolveBreakpoints(bpStyles, ctx)) {
+    emitLayer(bp.style, ctx, bp.key, bp.bpValue, atoms, classList);
+  }
+
+  const seen = new Set<string>();
+  const uniqueAtoms: EmitAtom[] = [];
+  for (const atom of atoms) {
+    if (seen.has(atom.id)) continue;
+    seen.add(atom.id);
+    uniqueAtoms.push(atom);
+  }
+
+  const uniqueClasses: string[] = [];
+  const seenClass = new Set<string>();
+  for (const id of classList) {
+    if (seenClass.has(id)) continue;
+    seenClass.add(id);
+    uniqueClasses.push(id);
+  }
+
+  return {
+    className: uniqueClasses.join(" "),
+    css: uniqueAtoms.map((a) => a.css).join("\n"),
+    styleKey,
+    atoms: uniqueAtoms,
+  };
+};
