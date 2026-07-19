@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { transformForBuild, composeAtomCss } from "../src/vite-plugin.js";
+import {
+  transformForBuild,
+  composeAtomCss,
+  buildSharedCss,
+} from "../src/vite-plugin.js";
 
 const ctx = {
   breakpoints: { pc: "1024px" },
@@ -61,5 +65,52 @@ describe("transformForBuild", () => {
     const displayCount = merged.split("display:flex").length - 1;
     expect(displayCount).toBe(1);
     expect(merged).toContain("gap:1rem");
+  });
+});
+
+describe("buildSharedCss", () => {
+  it("keeps pc display:none after a later module reuses display:flex", () => {
+    const mobileList = transformForBuild(
+      `import { style } from "som-style";
+       export const mobileList = style({
+         base: { display: "flex" },
+         pc: { display: "none" },
+       });`,
+      "mobile.js",
+      ctx
+    );
+    const other = transformForBuild(
+      `import { style } from "som-style";
+       export const other = style({ base: { display: "flex", gap: "1rem" } });`,
+      "other.js",
+      ctx
+    );
+
+    const shared = buildSharedCss([
+      { atoms: mobileList.atoms },
+      { atoms: other.atoms },
+    ]);
+
+    expect(shared.split("display:flex").length - 1).toBe(1);
+    const flexAt = shared.indexOf("display:flex");
+    const mediaNoneAt = shared.indexOf(
+      "@media (min-width: 1024px){.som-pc-"
+    );
+    const noneAt = shared.indexOf("display:none", mediaNoneAt);
+    expect(flexAt).toBeGreaterThanOrEqual(0);
+    expect(mediaNoneAt).toBeGreaterThan(flexAt);
+    expect(noneAt).toBeGreaterThan(mediaNoneAt);
+  });
+
+  it("places theme css before atom rules", () => {
+    const style = transformForBuild(
+      `import { style } from "som-style";\nexport const x = style({ base: { color: "red" } });`,
+      "x.js",
+      ctx
+    );
+    const shared = buildSharedCss([
+      { atoms: style.atoms, themeCss: ":root{--som-theme-hue:40;}" },
+    ]);
+    expect(shared.indexOf(":root")).toBeLessThan(shared.indexOf("color:red"));
   });
 });

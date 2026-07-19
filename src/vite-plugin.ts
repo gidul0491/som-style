@@ -222,6 +222,32 @@ export const composeAtomCss = (atoms: EmitAtom[]): string => {
   return [...baseAtoms, ...mediaAtoms].join("\n");
 };
 
+/** Virtual CSS key for the app-wide atom sheet (one import across modules). */
+export const SHARED_CSS_KEY = "__shared__";
+
+export type SharedSheetEntry = {
+  atoms: EmitAtom[];
+  themeCss?: string;
+};
+
+/**
+ * Merge per-module atoms/themes into one sheet: themes first, then base atoms,
+ * then @media — so shared base atoms cannot beat earlier breakpoint overrides.
+ */
+export const buildSharedCss = (entries: Iterable<SharedSheetEntry>): string => {
+  const atomMap = new Map<string, EmitAtom>();
+  const themes: string[] = [];
+  for (const entry of entries) {
+    if (entry.themeCss) themes.push(entry.themeCss);
+    for (const atom of entry.atoms) {
+      if (!atomMap.has(atom.id)) atomMap.set(atom.id, atom);
+    }
+  }
+  return [...themes, composeAtomCss([...atomMap.values()])]
+    .filter(Boolean)
+    .join("\n");
+};
+
 export type SomStylePluginOptions = {
   configFile?: string;
 };
@@ -258,7 +284,8 @@ const isProjectConfigJs = (file: string): boolean => {
 };
 
 /**
- * Vite plugin: static style extract + theme CSS virtual modules.
+ * Vite plugin: static style extract + one shared virtual CSS sheet.
+ * Atoms from every module are merged (deduped) with base rules before @media.
  * Prod path avoids the JS style engine when calls are static.
  *
  * `som-style` resolves to the real `som-style/runtime` file (not a virtual
@@ -274,6 +301,8 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
   let root = process.cwd();
   let server: ViteDevServer | undefined;
   const cssByKey = new Map<string, string>();
+  /** Per consumer module: atoms + optional theme CSS for the shared sheet. */
+  const sheetByConsumer = new Map<string, SharedSheetEntry>();
   /** canon(token file) → canon(consumer module paths) */
   const tokenFileConsumers = new Map<string, Set<string>>();
 
@@ -285,25 +314,31 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
     server.moduleGraph.invalidateModule(mod);
   };
 
+  const rebuildSharedSheet = () => {
+    const css = buildSharedCss(sheetByConsumer.values());
+    if (css) cssByKey.set(SHARED_CSS_KEY, css);
+    else cssByKey.delete(SHARED_CSS_KEY);
+    invalidateVirtualCss(SHARED_CSS_KEY);
+  };
+
   const applyExtractedCss = (
     consumerKey: string,
     themeCss: string,
-    styleResult: TransformStaticResult,
-    importKeys: { filePath: string; normalizedId: string }
+    styleResult: TransformStaticResult
   ): string => {
-    const fileCss = [themeCss, styleResult.css].filter(Boolean).join("\n");
-    const keys = [
-      consumerKey,
-      encodeURIComponent(importKeys.filePath),
-      encodeURIComponent(importKeys.normalizedId),
-    ];
-    for (const key of keys) {
-      if (fileCss) cssByKey.set(key, fileCss);
-      else cssByKey.delete(key);
-      invalidateVirtualCss(key);
+    const hasAtoms = styleResult.atoms.length > 0;
+    const hasTheme = Boolean(themeCss);
+    if (hasAtoms || hasTheme) {
+      sheetByConsumer.set(consumerKey, {
+        atoms: styleResult.atoms,
+        themeCss: themeCss || undefined,
+      });
+    } else {
+      sheetByConsumer.delete(consumerKey);
     }
-    if (!fileCss) return styleResult.code;
-    return `import "${toVirtualImport(consumerKey)}";\n${styleResult.code}`;
+    rebuildSharedSheet();
+    if (!hasAtoms && !hasTheme) return styleResult.code;
+    return `import "${toVirtualImport(SHARED_CSS_KEY)}";\n${styleResult.code}`;
   };
 
   const trackTokenConsumer = (tokenFile: string, consumerId: string) => {
@@ -408,10 +443,7 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
       tokenMaps
     );
     const consumerKey = encodeURIComponent(filePath);
-    applyExtractedCss(consumerKey, themeResult.css, styleResult, {
-      filePath,
-      normalizedId,
-    });
+    applyExtractedCss(consumerKey, themeResult.css, styleResult);
   };
 
   return {
@@ -428,12 +460,14 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
       if (configPath) this.addWatchFile(configPath);
       styleConfig = await loadSomStyleConfig(root, opts.configFile);
       cssByKey.clear();
+      sheetByConsumer.clear();
       tokenFileConsumers.clear();
     },
     async handleHotUpdate({ file, modules, server: devServer }) {
       if (isProjectConfigJs(file)) {
         styleConfig = await loadSomStyleConfig(root, opts.configFile);
         cssByKey.clear();
+        sheetByConsumer.clear();
         const rootCanon = canonPath(root);
         for (const mod of [...devServer.moduleGraph.idToModuleMap.values()]) {
           const id = mod.id ?? "";
@@ -571,10 +605,13 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
         const out = applyExtractedCss(
           consumerKey,
           themeResult.css,
-          styleResult,
-          { filePath: id, normalizedId }
+          styleResult
         );
-        if (out === styleResult.code && !themeResult.css && styleResult.atoms.length === 0) {
+        if (
+          out === styleResult.code &&
+          !themeResult.css &&
+          styleResult.atoms.length === 0
+        ) {
           return { code: styleResult.code, map: null };
         }
         return { code: out, map: null };
