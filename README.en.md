@@ -20,10 +20,12 @@ For Solid SSR, import from `som-style/solid`. Otherwise use `som-style`.
 ## Install
 
 ```bash
-pnpm add github:gidul0491/som-style#v0.1.0
+npm install som-style
 # or
-npm install github:gidul0491/som-style#v0.1.0
+pnpm add som-style
 ```
+
+Upgrading from 0.1.x? Read [CHANGELOG.md](./CHANGELOG.md) first  -  it covers a dropped-CSS fix and two compatibility changes.
 
 Create a `som-style/` folder at the project root and copy the scaffold:
 
@@ -193,6 +195,31 @@ configure({
   },
 });
 ```
+
+### Breakpoint precedence and `cascadeLayers`
+
+som-style emits one atomic class per declaration, and the same `property: value` shares one class across the whole project. `@media` does not raise specificity, so when `base` and `pc:` land on the same element, **whichever rule comes later in the sheet wins**.
+
+som-style always composes the sheet as **base → narrow breakpoints → wide breakpoints**, regardless of emission order. The runtime keeps one `<style>` per bucket in DOM order, and the Vite plugin sorts the shared sheet. Another module declaring the same value first can no longer kill your `pc:` override.
+
+That is enough inside one app. Once your CSS is mixed with third-party sheets or a separate build output, order is no longer yours to control  -  turn on `cascadeLayers` for that.
+
+```js
+configure({
+  breakpoints: { sm: "640px", pc: "1024px" },
+  cascadeLayers: true,
+});
+```
+
+```css
+@layer som.base, som.sm, som.pc;
+@layer som.base { .som-1l2w6rg{grid-template-columns:repeat(2,minmax(0,1fr));} }
+@layer som.pc   { @media (min-width: 1024px){ .som-pc-zrz4ai{...repeat(4,...);} } }
+```
+
+The layer order is declared up front, so the outcome is identical no matter what order the rules arrive in.
+
+> **Caveat (why it defaults to `false`)**: layered CSS **always loses to unlayered CSS**, regardless of specificity. Turning this on lets a reset or a global `.css` file start beating som-style classes. Enable it only when you can move consumer CSS into layers too. (Browsers: Chrome/Edge 99+, Safari 15.4+, Firefox 97+)
 
 ### `som-style/theme.js` example
 
@@ -508,8 +535,8 @@ Add once to the document `<head>`:
 After cloning this repo:
 
 ```bash
-git clone https://github.com/gidul0491/som-style.git
-cd som-style
+git clone https://github.com/gidul0491/som-style-css.git
+cd som-style-css
 npm install
 cd examples/vite
 npm install
@@ -519,7 +546,7 @@ npm run dev
 Open the URL Vite prints (usually `http://localhost:5173`).
 
 The in-repo example uses `file:../..` (the local package you just built).  
-In your own app, install with `github:gidul0491/som-style` as in the Install section.
+In your own app, install with `npm install som-style` as in the Install section.
 
 Edit these for the demo:
 

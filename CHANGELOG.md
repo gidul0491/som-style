@@ -1,0 +1,37 @@
+# 변경 이력
+
+## 0.2.1
+
+0.2.0 재배포. 패키지 내용은 0.2.0과 동일합니다.
+
+## 0.2.0
+
+### 고친 것
+
+**빌드 시 다른 모듈의 CSS가 통째로 유실되던 문제.** 공유 시트를 첫 스타일 모듈이 import하는 순간 Rollup이 `load()`를 호출하는데, 그 시점엔 나머지 모듈이 아직 변환되지 않았습니다. 그 뒤에 변환된 모듈의 원자는 전부 버려졌고, 에러도 경고도 없었습니다. 앱 구조에 따라 손실량이 달라집니다. 이제 빌드 중에는 자리표시 규칙을 내보내고, 모든 모듈 변환이 끝난 뒤 `generateBundle`에서 완성된 시트로 교체합니다.
+
+**`base` 선언이 breakpoint 규칙을 이기던 문제.** `@media`는 특이도를 올리지 않으므로 같은 요소에 붙은 `base`와 `pc:` 중에서는 시트에서 뒤에 온 쪽이 이깁니다. 원자 클래스는 프로젝트 전체에서 공유(dedup)되기 때문에, 다른 모듈이 우연히 같은 값을 먼저 선언하면 `base` 규칙이 `@media` 뒤로 밀려 breakpoint override가 조용히 죽었습니다. 이제 방출 순서와 무관하게 항상 `base` → 좁은 breakpoint → 넓은 breakpoint 순으로 조립합니다.
+
+**breakpoint끼리 순서가 뒤집히던 문제.** `@media` 규칙을 min-width로 정렬하지 않아, 모듈 간 dedup 후 `sm`이 `pc` 뒤로 갈 수 있었습니다. `em` / `rem` 값도 px로 환산해 정렬하므로 `48em`이 `80em`보다 앞섭니다.
+
+세 가지 모두 빌드, 런타임, SSR 세 경로에 적용됩니다.
+
+### 추가된 것
+
+**`cascadeLayers` 옵션 (기본 `false`).** 규칙을 `@layer <prefix>.base` / `@layer <prefix>.<breakpoint>`로 감싸고 레이어 순서를 미리 선언합니다. 서드파티 시트나 별도 빌드 결과물과 섞일 때 breakpoint 우선순위를 보장합니다.
+
+```js
+configure({ breakpoints: { pc: "1024px" }, cascadeLayers: true });
+```
+
+레이어에 든 CSS는 특이도와 무관하게 레이어 없는 CSS에 지므로, 리셋이나 전역 `.css`가 som-style 클래스를 이기게 됩니다. 소비자 CSS도 함께 레이어로 옮길 수 있을 때만 켜세요.
+
+### 호환성
+
+- `somStyle()`의 반환 타입이 `Plugin`에서 `Plugin[]`로 바뀌었습니다. `plugins: [somStyle()]`로 쓰고 있다면 그대로 동작합니다. 반환값의 타입을 직접 참조하거나 훅을 꺼내 쓰는 코드는 수정이 필요합니다.
+- 런타임이 단일 `<style id="som-single-sheet">` 대신 버킷별 시트(`som-sheet-base`, `som-sheet-<breakpoint>`)를 만듭니다. `cascadeLayers`를 켜면 `som-layer-order`가 앞에 추가됩니다. 그 id에 의존하는 코드가 있으면 수정이 필요합니다.
+- 클래스 이름 해시 생성 방식은 바뀌지 않았습니다. 마크업과 스냅샷은 영향받지 않습니다.
+
+## 0.1.1
+
+최초 npm 배포.

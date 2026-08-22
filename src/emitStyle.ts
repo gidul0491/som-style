@@ -4,11 +4,28 @@ export type EmitStyleContext = {
   breakpoints: Record<string, string>;
   classPrefix: string;
   breakpoint: string;
+  /**
+   * Wrap emitted rules in `@layer <prefix>.<bucket>` and declare the layer
+   * order up front. Makes breakpoint precedence independent of source order
+   * even across separately-authored sheets. Opt-in: layered CSS always loses
+   * to unlayered CSS, so enabling it changes how consumer CSS interacts.
+   */
+  cascadeLayers?: boolean;
 };
 
 export type EmitAtom = {
   id: string;
+  /** Single rule (media-wrapped for breakpoints), without any `@layer`. */
   css: string;
+  /**
+   * Cascade bucket. 0 for base, otherwise the breakpoint min-width in px.
+   * Sorting atoms by this makes emission order irrelevant.
+   */
+  order: number;
+  /** Breakpoint key this atom belongs to (null for base). */
+  bpKey: string | null;
+  /** Layer name used when `cascadeLayers` is on (e.g. `som.pc`). */
+  layer: string;
 };
 
 export type EmitStyleResult = {
@@ -40,6 +57,17 @@ const bpToken = (key: string) => {
   const t = key.trim().replace(/[^a-zA-Z0-9_-]+/g, "");
   return t || "bp";
 };
+
+/** CSS ident for `@layer` names — must not start with a digit. */
+export const cssIdent = (raw: string): string => {
+  const t = raw.trim().replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!t) return "x";
+  return /^[0-9]/.test(t) ? `bp-${t}` : t;
+};
+
+/** Layer name for a bucket: `som.base` / `som.pc` / `som.bp-768px`. */
+export const layerName = (classPrefix: string, bpKey: string | null): string =>
+  `${cssIdent(classPrefix)}.${bpKey ? cssIdent(bpKey) : "base"}`;
 
 const splitFlatAndNested = (style: StyleObject) => {
   const flat: Record<string, string | number> = {};
@@ -86,7 +114,7 @@ const processNestedObject = (
   return { mainRules, extraRules };
 };
 
-const parsePxNumeric = (val: string): number => {
+export const parsePxNumeric = (val: string): number => {
   const num = parseFloat(val);
   if (isNaN(num)) return 0;
   if (val.endsWith("rem") || val.endsWith("em")) return num * 16;
@@ -97,12 +125,16 @@ const isValidCssLength = (val: string): boolean => {
   return /^\d+(\.\d+)?(px|rem|em|vw|vh|%|vmin|vmax)$/i.test(val.trim());
 };
 
+/** Breakpoint atoms must never tie with base (order 0) after sorting. */
+const bucketOrder = (numValue: number) => Math.max(1, numValue);
+
 const makeAtom = (
   prefix: string,
   bpKey: string | null,
   prop: string,
   value: string | number,
-  mediaMinWidth: string | null
+  mediaMinWidth: string | null,
+  order: number
 ): EmitAtom => {
   const kebab = camelToKebab(prop);
   const normalized = cssValue(value);
@@ -114,14 +146,15 @@ const makeAtom = (
   const css = mediaMinWidth
     ? `@media (min-width: ${mediaMinWidth}){${decl}}`
     : decl;
-  return { id, css };
+  return { id, css, order, bpKey, layer: layerName(prefix, bpKey) };
 };
 
 const makeNestedCompound = (
   prefix: string,
   bpKey: string | null,
   nested: StyleObject,
-  mediaMinWidth: string | null
+  mediaMinWidth: string | null,
+  order: number
 ): EmitAtom | null => {
   if (Object.keys(nested).length === 0) return null;
 
@@ -136,7 +169,7 @@ const makeNestedCompound = (
   const css = mediaMinWidth
     ? `@media (min-width: ${mediaMinWidth}){${body}}`
     : body;
-  return { id, css };
+  return { id, css, order, bpKey, layer: layerName(prefix, bpKey) };
 };
 
 type ResolvedBreakpoint = {
@@ -178,13 +211,21 @@ const emitLayer = (
   ctx: EmitStyleContext,
   bpKey: string | null,
   mediaMinWidth: string | null,
+  order: number,
   atoms: EmitAtom[],
   classList: string[]
 ) => {
   const { flat, nested } = splitFlatAndNested(style);
 
   for (const prop of Object.keys(flat).sort()) {
-    const atom = makeAtom(ctx.classPrefix, bpKey, prop, flat[prop], mediaMinWidth);
+    const atom = makeAtom(
+      ctx.classPrefix,
+      bpKey,
+      prop,
+      flat[prop],
+      mediaMinWidth,
+      order
+    );
     atoms.push(atom);
     classList.push(atom.id);
   }
@@ -193,7 +234,8 @@ const emitLayer = (
     ctx.classPrefix,
     bpKey,
     nested,
-    mediaMinWidth
+    mediaMinWidth,
+    order
   );
   if (compound) {
     atoms.push(compound);
@@ -214,16 +256,25 @@ export const emitStyle = (
     options,
     bpMap: ctx.breakpoints,
     prefix: ctx.classPrefix,
+    layers: Boolean(ctx.cascadeLayers),
   });
 
   const { base, ...bpStyles } = options;
   const atoms: EmitAtom[] = [];
   const classList: string[] = [];
 
-  emitLayer(base || {}, ctx, null, null, atoms, classList);
+  emitLayer(base || {}, ctx, null, null, 0, atoms, classList);
 
   for (const bp of resolveBreakpoints(bpStyles, ctx)) {
-    emitLayer(bp.style, ctx, bp.key, bp.bpValue, atoms, classList);
+    emitLayer(
+      bp.style,
+      ctx,
+      bp.key,
+      bp.bpValue,
+      bucketOrder(bp.numValue),
+      atoms,
+      classList
+    );
   }
 
   const seen = new Set<string>();

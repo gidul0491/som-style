@@ -1,5 +1,11 @@
 # Agent notes (som-style)
 
+- Mobile first, always: `base` is the phone layout. Write that first, then add
+  `tablet` / `pc` only for the properties that actually change. Never write the
+  desktop layout into `base` and shrink it down in a breakpoint.
+- Prefer a value that is responsive on its own over a breakpoint override:
+  `repeat(auto-fit, minmax(...))`, `clamp()`, `flex-wrap` + `flex-basis`.
+  Fewer declarations to keep in sync.
 - Use `style({ base, pc })` or app `som-style/preset`.
 - Page styles: put them anywhere you like; `style.js` in scaffold is only an example.
 - To change a few properties, use `handle.extend({ base: { ... } })`.

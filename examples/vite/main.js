@@ -48,7 +48,7 @@ root.innerHTML = `
       </p>
       <div class="${row}">
         <a class="${button}" href="#presets">프리셋 보기</a>
-        <a class="${buttonGhost}" href="https://github.com/gidul0491/som-style">GitHub</a>
+        <a class="${buttonGhost}" href="https://github.com/gidul0491/som-style-css">GitHub</a>
         <button type="button" class="${buttonGhost}" id="theme-toggle">테마</button>
       </div>
     </section>

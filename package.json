@@ -1,6 +1,6 @@
 {
   "name": "som-style",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Mobile-first CSS-in-JS helper with OKLCH design tokens by default",
   "type": "module",
   "main": "./dist/index.js",
@@ -29,7 +29,8 @@
   },
   "files": [
     "dist",
-    "scaffold"
+    "scaffold",
+    "CHANGELOG.md"
   ],
   "sideEffects": [
     "**/*.css",
@@ -74,11 +75,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gidul0491/som-style.git"
+    "url": "git+https://github.com/gidul0491/som-style-css.git"
   },
   "bugs": {
-    "url": "https://github.com/gidul0491/som-style/issues"
+    "url": "https://github.com/gidul0491/som-style-css/issues"
   },
-  "homepage": "https://github.com/gidul0491/som-style#readme",
+  "homepage": "https://github.com/gidul0491/som-style-css#readme",
   "license": "MIT"
 }
