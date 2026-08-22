@@ -536,8 +536,8 @@ setTheme(getTheme() === "dark" ? "light" : "dark");
 이 저장소를 클론한 뒤:
 
 ```bash
-git clone https://github.com/gidul0491/som-style.git
-cd som-style
+git clone https://github.com/gidul0491/som-style-css.git
+cd som-style-css
 npm install
 cd examples/vite
 npm install
@@ -547,7 +547,7 @@ npm run dev
 브라우저에서 안내된 주소(보통 `http://localhost:5173`)를 엽니다.
 
 이 저장소 안 예제는 `file:../..`로 **방금 빌드한 로컬 패키지**를 씁니다.  
-앱에서 쓸 때는 README 설치절처럼 `github:gidul0491/som-style`를 설치하세요.
+앱에서 쓸 때는 README 설치절처럼 `npm install som-style`로 설치하세요.
 
 데모에서 바로 바꿀 파일:
 

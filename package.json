@@ -75,11 +75,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gidul0491/som-style.git"
+    "url": "git+https://github.com/gidul0491/som-style-css.git"
   },
   "bugs": {
-    "url": "https://github.com/gidul0491/som-style/issues"
+    "url": "https://github.com/gidul0491/som-style-css/issues"
   },
-  "homepage": "https://github.com/gidul0491/som-style#readme",
+  "homepage": "https://github.com/gidul0491/som-style-css#readme",
   "license": "MIT"
 }

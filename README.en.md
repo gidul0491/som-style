@@ -535,8 +535,8 @@ Add once to the document `<head>`:
 After cloning this repo:
 
 ```bash
-git clone https://github.com/gidul0491/som-style.git
-cd som-style
+git clone https://github.com/gidul0491/som-style-css.git
+cd som-style-css
 npm install
 cd examples/vite
 npm install
@@ -546,7 +546,7 @@ npm run dev
 Open the URL Vite prints (usually `http://localhost:5173`).
 
 The in-repo example uses `file:../..` (the local package you just built).  
-In your own app, install with `github:gidul0491/som-style` as in the Install section.
+In your own app, install with `npm install som-style` as in the Install section.
 
 Edit these for the demo:
 
