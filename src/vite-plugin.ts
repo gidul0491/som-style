@@ -2,6 +2,7 @@ import type { Plugin, ViteDevServer, ModuleNode } from "vite";
 import { readFileSync } from "node:fs";
 import { dirname, normalize, resolve as pathResolve } from "node:path";
 import { emitStyle, type EmitAtom, type EmitStyleContext } from "./emitStyle.js";
+import { composeAtomCss } from "./composeCss.js";
 import { analyzeStyleCalls } from "./staticAnalyze.js";
 import {
   loadSomStyleConfig,
@@ -19,6 +20,26 @@ import type { ResponsiveStyleOptions } from "./types.js";
 
 const VIRTUAL_PREFIX = "virtual:som-style-css:";
 const RESOLVED_PREFIX = "\0" + VIRTUAL_PREFIX;
+
+/**
+ * Build-only stand-in for the shared sheet. Rollup calls `load()` for the
+ * virtual CSS module as soon as the first styled module imports it — long
+ * before the rest of the graph is transformed — so the sheet is still growing
+ * at that point. We emit this marker rule instead and swap the finished sheet
+ * in from `generateBundle`, once every module has been seen.
+ *
+ * It has to be a real rule, not a comment: CSS minification runs first and
+ * strips comments.
+ */
+const SHEET_PLACEHOLDER_CLASS = "__som_style_sheet__";
+const SHEET_PLACEHOLDER_RULE = `.${SHEET_PLACEHOLDER_CLASS}{--som-style-sheet:1}`;
+const SHEET_PLACEHOLDER_RE = new RegExp(
+  `\\.${SHEET_PLACEHOLDER_CLASS}\\s*\\{[^}]*\\}`,
+  "g"
+);
+
+const assetSourceToString = (source: string | Uint8Array): string =>
+  typeof source === "string" ? source : new TextDecoder().decode(source);
 
 export type TransformStaticResult = {
   code: string;
@@ -151,11 +172,10 @@ export const transformForBuild = (
     }
   }
 
-  const cssParts: string[] = [];
   let next = code;
-  const atomById = new Map<string, { id: string; css: string }>();
+  const atomById = new Map<string, EmitAtom>();
 
-  const collectAtoms = (atoms: { id: string; css: string }[]) => {
+  const collectAtoms = (atoms: EmitAtom[]) => {
     for (const atom of atoms) {
       if (!atomById.has(atom.id)) atomById.set(atom.id, atom);
     }
@@ -202,25 +222,15 @@ export const transformForBuild = (
       next.slice(hit.end);
   }
 
-  // Base atoms first, then media — prevents later base rules from beating earlier @media.
-  const css = composeAtomCss([...atomById.values()]);
+  // Ordered base → ascending breakpoints; emission order must not decide.
+  const css = composeAtomCss([...atomById.values()], {
+    cascadeLayers: ctx.cascadeLayers,
+  });
 
   return { code: next, css, atoms: [...atomById.values()] };
 };
 
-/** Stable shared-sheet CSS: base rules, then @media (atomic dedupe by id). */
-export const composeAtomCss = (atoms: EmitAtom[]): string => {
-  const baseAtoms: string[] = [];
-  const mediaAtoms: string[] = [];
-  const seen = new Set<string>();
-  for (const atom of atoms) {
-    if (seen.has(atom.id)) continue;
-    seen.add(atom.id);
-    if (atom.css.startsWith("@media")) mediaAtoms.push(atom.css);
-    else baseAtoms.push(atom.css);
-  }
-  return [...baseAtoms, ...mediaAtoms].join("\n");
-};
+export { composeAtomCss } from "./composeCss.js";
 
 /** Virtual CSS key for the app-wide atom sheet (one import across modules). */
 export const SHARED_CSS_KEY = "__shared__";
@@ -231,10 +241,14 @@ export type SharedSheetEntry = {
 };
 
 /**
- * Merge per-module atoms/themes into one sheet: themes first, then base atoms,
- * then @media — so shared base atoms cannot beat earlier breakpoint overrides.
+ * Merge per-module atoms/themes into one sheet: themes first, then atoms
+ * ordered base → ascending breakpoints. Atoms are deduped across modules, so
+ * their first-use position must not decide which breakpoint wins.
  */
-export const buildSharedCss = (entries: Iterable<SharedSheetEntry>): string => {
+export const buildSharedCss = (
+  entries: Iterable<SharedSheetEntry>,
+  options: { cascadeLayers?: boolean } = {}
+): string => {
   const atomMap = new Map<string, EmitAtom>();
   const themes: string[] = [];
   for (const entry of entries) {
@@ -243,7 +257,7 @@ export const buildSharedCss = (entries: Iterable<SharedSheetEntry>): string => {
       if (!atomMap.has(atom.id)) atomMap.set(atom.id, atom);
     }
   }
-  return [...themes, composeAtomCss([...atomMap.values()])]
+  return [...themes, composeAtomCss([...atomMap.values()], options)]
     .filter(Boolean)
     .join("\n");
 };
@@ -292,19 +306,24 @@ const isProjectConfigJs = (file: string): boolean => {
  * module that re-exports a bare specifier — that can white-screen in the
  * browser when the specifier is left unresolved).
  */
-export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
+export function somStyle(opts: SomStylePluginOptions = {}): Plugin[] {
   let styleConfig: LoadedStyleConfig = {
     breakpoints: { pc: "1024px" },
     classPrefix: "som",
     breakpoint: "1024px",
+    cascadeLayers: false,
   };
   let root = process.cwd();
+  let isBuild = false;
   let server: ViteDevServer | undefined;
   const cssByKey = new Map<string, string>();
   /** Per consumer module: atoms + optional theme CSS for the shared sheet. */
   const sheetByConsumer = new Map<string, SharedSheetEntry>();
   /** canon(token file) → canon(consumer module paths) */
   const tokenFileConsumers = new Map<string, Set<string>>();
+  /** Dev: the browser already holds a copy of the shared sheet. */
+  let sheetServed = false;
+  let sheetReloadTimer: ReturnType<typeof setTimeout> | null = null;
 
   const invalidateVirtualCss = (key: string) => {
     if (!server) return;
@@ -314,11 +333,31 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
     server.moduleGraph.invalidateModule(mod);
   };
 
+  /**
+   * Dev: modules are transformed on demand, so the sheet can still grow after
+   * the browser has fetched it — invalidating alone does not make it re-fetch.
+   * Reload once things settle. The graph is warm by then, so the next serve is
+   * complete and this does not fire again.
+   */
+  const scheduleSheetReload = () => {
+    if (!server) return;
+    if (sheetReloadTimer) clearTimeout(sheetReloadTimer);
+    sheetReloadTimer = setTimeout(() => {
+      sheetReloadTimer = null;
+      sheetServed = false;
+      server?.ws.send({ type: "full-reload" });
+    }, 100);
+  };
+
   const rebuildSharedSheet = () => {
-    const css = buildSharedCss(sheetByConsumer.values());
+    const previous = cssByKey.get(SHARED_CSS_KEY);
+    const css = buildSharedCss(sheetByConsumer.values(), {
+      cascadeLayers: styleConfig.cascadeLayers,
+    });
     if (css) cssByKey.set(SHARED_CSS_KEY, css);
     else cssByKey.delete(SHARED_CSS_KEY);
     invalidateVirtualCss(SHARED_CSS_KEY);
+    if (sheetServed && previous !== css) scheduleSheetReload();
   };
 
   const applyExtractedCss = (
@@ -446,11 +485,12 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
     applyExtractedCss(consumerKey, themeResult.css, styleResult);
   };
 
-  return {
+  const plugin: Plugin = {
     name: "som-style",
     enforce: "pre",
     configResolved(config) {
       root = config.root;
+      isBuild = config.command === "build";
     },
     configureServer(devServer) {
       server = devServer;
@@ -462,6 +502,7 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
       cssByKey.clear();
       sheetByConsumer.clear();
       tokenFileConsumers.clear();
+      sheetServed = false;
     },
     async handleHotUpdate({ file, modules, server: devServer }) {
       if (isProjectConfigJs(file)) {
@@ -550,6 +591,9 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
     load(id) {
       const key = keyFromResolvedId(id);
       if (key === null) return null;
+      // See SHEET_PLACEHOLDER_RULE — during build the sheet is incomplete here.
+      if (isBuild && key === SHARED_CSS_KEY) return SHEET_PLACEHOLDER_RULE;
+      if (key === SHARED_CSS_KEY) sheetServed = true;
       return cssByKey.get(key) ?? "";
     },
     async transform(code, id) {
@@ -622,6 +666,28 @@ export function somStyle(opts: SomStylePluginOptions = {}): Plugin {
       }
     },
   };
+
+  /**
+   * Runs after Vite has emitted (and minified) the CSS assets, so the sheet
+   * we drop in is the complete one. Without this the bundle keeps only the
+   * atoms that existed when the virtual module was first loaded.
+   */
+  const sheetPlugin: Plugin = {
+    name: "som-style:sheet",
+    enforce: "post",
+    apply: "build",
+    generateBundle(_options, bundle) {
+      const css = cssByKey.get(SHARED_CSS_KEY) ?? "";
+      for (const file of Object.values(bundle)) {
+        if (file.type !== "asset" || !file.fileName.endsWith(".css")) continue;
+        const source = assetSourceToString(file.source);
+        if (!source.includes(SHEET_PLACEHOLDER_CLASS)) continue;
+        file.source = source.replace(SHEET_PLACEHOLDER_RE, () => css);
+      }
+    },
+  };
+
+  return [plugin, sheetPlugin];
 }
 
 export default somStyle;

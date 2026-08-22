@@ -20,10 +20,12 @@ Solid에서 서버 렌더링(SSR)을 쓰면 `som-style/solid`를 import 하세�
 ## 설치
 
 ```bash
-pnpm add github:gidul0491/som-style#v0.1.0
+npm install som-style
 # 또는
-npm install github:gidul0491/som-style#v0.1.0
+pnpm add som-style
 ```
+
+0.1.x에서 올라오신다면 [CHANGELOG.md](./CHANGELOG.md)를 먼저 보세요 — CSS 유실 수정과 호환성 변경이 있습니다.
 
 프로젝트 루트에 `som-style/` 폴더를 만들고 스캐폴드를 복사합니다.
 
@@ -194,6 +196,31 @@ configure({
   },
 });
 ```
+
+### 중단점 우선순위와 `cascadeLayers`
+
+som-style은 선언 하나당 원자 클래스 하나를 만들고, 같은 `property: value`는 프로젝트 전체에서 같은 클래스를 공유합니다. `@media`는 특이도를 올리지 않으므로, `base`와 `pc:`가 같은 요소에 붙으면 **시트에서 뒤에 나온 규칙이 이깁니다**.
+
+som-style은 방출 순서와 무관하게 항상 **base → 좁은 중단점 → 넓은 중단점** 순으로 시트를 조립합니다. 런타임은 버킷별 `<style>`을 순서대로 두고, Vite 플러그인은 공유 시트를 정렬해서 냅니다. 다른 모듈이 우연히 같은 값을 먼저 선언해도 `pc:`가 죽지 않습니다.
+
+앱 안에서는 이걸로 충분하지만, 서드파티 시트나 별도 빌드 결과물과 섞이면 순서를 보장할 수 없습니다. 그럴 때 `cascadeLayers`를 켜세요.
+
+```js
+configure({
+  breakpoints: { sm: "640px", pc: "1024px" },
+  cascadeLayers: true,
+});
+```
+
+```css
+@layer som.base, som.sm, som.pc;
+@layer som.base { .som-1l2w6rg{grid-template-columns:repeat(2,minmax(0,1fr));} }
+@layer som.pc   { @media (min-width: 1024px){ .som-pc-zrz4ai{...repeat(4,...);} } }
+```
+
+레이어 순서를 미리 선언하므로 규칙이 어떤 순서로 들어오든 결과가 같습니다.
+
+> **주의 (기본값이 `false`인 이유)**: 레이어에 든 CSS는 특이도와 무관하게 **레이어 없는 CSS에 무조건 집니다**. 켜는 순간 리셋이나 전역 `.css` 파일이 som-style 클래스를 이기기 시작합니다. 소비자 CSS도 같이 레이어로 옮길 수 있을 때만 켜세요. (브라우저: Chrome/Edge 99+, Safari 15.4+, Firefox 97+)
 
 ### `som-style/theme.js` 예시
 

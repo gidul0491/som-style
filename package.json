@@ -1,6 +1,6 @@
 {
   "name": "som-style",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Mobile-first CSS-in-JS helper with OKLCH design tokens by default",
   "type": "module",
   "main": "./dist/index.js",
@@ -29,7 +29,8 @@
   },
   "files": [
     "dist",
-    "scaffold"
+    "scaffold",
+    "CHANGELOG.md"
   ],
   "sideEffects": [
     "**/*.css",

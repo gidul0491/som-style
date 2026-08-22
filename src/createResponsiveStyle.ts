@@ -1,9 +1,15 @@
 import type { ResponsiveStyleOptions, RxStyleConfig } from "./types.js";
 import {
+  cssIdent,
   emitStyle,
   type EmitAtom,
   type EmitStyleContext,
 } from "./emitStyle.js";
+import {
+  atomCss,
+  composeAtomCss,
+  layerOrderForContext,
+} from "./composeCss.js";
 import {
   cloneResponsiveOptions,
   mergeResponsiveOptions,
@@ -34,19 +40,23 @@ export type StyleHandle = string & {
 
 const injectedAtoms = new Set<string>();
 const styleCache = new Map<string, StyleCacheEntry>();
-const styleRegistry = new Set<string>();
-let singleStyleSheet: HTMLStyleElement | null = null;
+/** SSR: raw global CSS (theme vars) kept separate from ordered atoms. */
+const globalCssRegistry = new Set<string>();
+/** SSR: atoms are composed on read so order does not depend on first use. */
+const ssrAtoms = new Map<string, EmitAtom>();
 
 let config: {
   isServer: () => boolean;
   breakpoint: string;
   breakpoints: Record<string, string>;
   classPrefix: string;
+  cascadeLayers: boolean;
 } = {
   isServer: () => typeof document === "undefined",
   breakpoint: "1024px",
   breakpoints: { pc: "1024px" },
   classPrefix: "som",
+  cascadeLayers: false,
 };
 
 export const configure = (options: RxStyleConfig) => {
@@ -64,7 +74,13 @@ export const configure = (options: RxStyleConfig) => {
       ...userBreakpoints,
     },
     classPrefix: options.classPrefix ?? config.classPrefix,
+    cascadeLayers: options.cascadeLayers ?? config.cascadeLayers,
   };
+
+  // Breakpoints may have grown — keep the declared layer order in sync.
+  if (!config.isServer() && typeof document !== "undefined") {
+    syncLayerOrderElement();
+  }
 };
 
 /** Snapshot used by runtime emit and the Vite plugin. */
@@ -72,15 +88,24 @@ export const getStyleConfig = (): EmitStyleContext => ({
   breakpoints: { ...config.breakpoints },
   classPrefix: config.classPrefix,
   breakpoint: config.breakpoint,
+  cascadeLayers: config.cascadeLayers,
 });
 
 /** Returns CSS collected during SSR. */
 export const getCollectedStyles = () =>
-  Array.from(styleRegistry).join("\n");
+  [
+    ...globalCssRegistry,
+    composeAtomCss(ssrAtoms.values(), {
+      cascadeLayers: config.cascadeLayers,
+    }),
+  ]
+    .filter(Boolean)
+    .join("\n");
 
 /** Clears the SSR style registry. */
 export const clearCollectedStyles = () => {
-  styleRegistry.clear();
+  globalCssRegistry.clear();
+  ssrAtoms.clear();
 };
 
 /** Injects global CSS on the client, or collects it for SSR. */
@@ -96,67 +121,152 @@ export const injectGlobalCss = (css: string, id: string) => {
     styleEl.id = elId;
     styleEl.textContent = css;
     document.head.appendChild(styleEl);
-  } else if (!styleRegistry.has(css)) {
-    styleRegistry.add(css);
+  } else {
+    globalCssRegistry.add(css);
   }
 };
 
-const getSingleStyleSheet = (): HTMLStyleElement | null => {
+/**
+ * One <style> per cascade bucket (base, then each breakpoint), kept in
+ * ascending DOM order. Atoms are shared across modules and arrive in
+ * first-use order, so a single sheet would let a deduped base rule land
+ * after the breakpoint rule that is supposed to override it.
+ */
+type SheetBucket = {
+  order: number;
+  layer: string;
+  el: HTMLStyleElement;
+  rules: string[];
+  /** insertRule failed once — this element is text-driven from now on. */
+  textMode: boolean;
+};
+
+/** Sorted ascending by `order`; DOM order matches. */
+const sheetBuckets: SheetBucket[] = [];
+let layerOrderEl: HTMLStyleElement | null = null;
+
+const LAYER_ORDER_ID = "som-layer-order";
+
+const bucketElementId = (bpKey: string | null) =>
+  `som-sheet-${bpKey ? cssIdent(bpKey) : "base"}`;
+
+/** Declare `@layer` order ahead of every layered rule (no-op when off). */
+const syncLayerOrderElement = () => {
+  if (!config.cascadeLayers) return;
+  const css = layerOrderForContext(
+    getStyleConfig(),
+    sheetBuckets
+      .filter((b) => b.order > 0)
+      .map((b) => ({ order: b.order, layer: b.layer }))
+  );
+  if (!css) return;
+
+  if (!layerOrderEl) {
+    layerOrderEl =
+      (document.getElementById(LAYER_ORDER_ID) as HTMLStyleElement | null) ??
+      document.createElement("style");
+    layerOrderEl.id = LAYER_ORDER_ID;
+  }
+  if (!layerOrderEl.parentNode) {
+    document.head.insertBefore(layerOrderEl, sheetBuckets[0]?.el ?? null);
+  }
+  if (layerOrderEl.textContent !== css) layerOrderEl.textContent = css;
+};
+
+const getBucket = (atom: EmitAtom): SheetBucket | null => {
   if (config.isServer() || typeof document === "undefined") return null;
-  if (!singleStyleSheet) {
-    const elId = "som-single-sheet";
-    const existing = document.getElementById(elId) as HTMLStyleElement | null;
-    if (existing) {
-      singleStyleSheet = existing;
+
+  syncLayerOrderElement();
+
+  const existing = sheetBuckets.find((b) => b.order === atom.order);
+  if (existing) return existing;
+
+  const elId = bucketElementId(atom.bpKey);
+  let el = document.getElementById(elId) as HTMLStyleElement | null;
+  if (!el) {
+    el = document.createElement("style");
+    el.id = elId;
+  }
+
+  const nextIdx = sheetBuckets.findIndex((b) => b.order > atom.order);
+  if (!el.parentNode) {
+    if (nextIdx === -1) {
+      const last = sheetBuckets[sheetBuckets.length - 1];
+      document.head.insertBefore(el, last ? last.el.nextSibling : null);
     } else {
-      const styleEl = document.createElement("style");
-      styleEl.id = elId;
-      document.head.appendChild(styleEl);
-      singleStyleSheet = styleEl;
+      document.head.insertBefore(el, sheetBuckets[nextIdx].el);
     }
   }
-  return singleStyleSheet;
+
+  const bucket: SheetBucket = {
+    order: atom.order,
+    layer: atom.layer,
+    el,
+    rules: [],
+    textMode: false,
+  };
+  if (nextIdx === -1) sheetBuckets.push(bucket);
+  else sheetBuckets.splice(nextIdx, 0, bucket);
+  // A brand-new bucket may be an inline breakpoint the config never named.
+  syncLayerOrderElement();
+  return bucket;
 };
 
-const insertCssChunk = (cssContent: string) => {
-  const styleEl = getSingleStyleSheet();
-  if (styleEl && styleEl.sheet) {
-    try {
-      const sheet = styleEl.sheet;
-      const rules = cssContent
-        .split(/(?<=\})\s*(?=@media|\.[a-zA-Z0-9_-]+)/g)
-        .map((r) => r.trim())
-        .filter(Boolean);
+/** A compound atom (&:hover, descendants) can carry several rules. */
+const splitRules = (cssContent: string): string[] =>
+  cssContent
+    .split(/(?<=\})\s*(?=@layer|@media|\.[a-zA-Z0-9_-]+)/g)
+    .map((r) => r.trim())
+    .filter(Boolean);
 
+const appendToBucket = (bucket: SheetBucket, cssContent: string) => {
+  const rules = splitRules(cssContent);
+  bucket.rules.push(...rules);
+
+  if (!bucket.textMode && bucket.el.sheet) {
+    try {
       for (const rule of rules) {
-        sheet.insertRule(rule, sheet.cssRules.length);
+        bucket.el.sheet.insertRule(rule, bucket.el.sheet.cssRules.length);
       }
       return;
     } catch {
-      styleEl.appendChild(document.createTextNode(cssContent + "\n"));
-      return;
+      // Writing textContent re-parses the sheet, discarding insertRule work —
+      // so once we fall back, this element stays text-driven.
+      bucket.textMode = true;
     }
   }
-  if (styleEl) {
-    styleEl.appendChild(document.createTextNode(cssContent + "\n"));
-  }
+
+  bucket.textMode = true;
+  bucket.el.textContent = bucket.rules.join("\n");
 };
 
 const ensureAtoms = (atoms: EmitAtom[]) => {
   if (!config.isServer() && typeof document !== "undefined") {
+    const options = { cascadeLayers: config.cascadeLayers };
     for (const atom of atoms) {
       if (injectedAtoms.has(atom.id)) continue;
+      const bucket = getBucket(atom);
+      if (!bucket) continue;
       injectedAtoms.add(atom.id);
-      insertCssChunk(atom.css);
+      appendToBucket(bucket, atomCss(atom, options));
     }
     return;
   }
 
   for (const atom of atoms) {
-    if (!styleRegistry.has(atom.css)) {
-      styleRegistry.add(atom.css);
-    }
+    if (!ssrAtoms.has(atom.id)) ssrAtoms.set(atom.id, atom);
   }
+};
+
+/** @internal drop injected sheets/caches (tests). */
+export const __resetStyleSheetsForTests = () => {
+  injectedAtoms.clear();
+  styleCache.clear();
+  clearCollectedStyles();
+  for (const bucket of sheetBuckets) bucket.el.remove();
+  sheetBuckets.length = 0;
+  layerOrderEl?.remove();
+  layerOrderEl = null;
 };
 
 const isStyleHandle = (value: unknown): value is StyleHandle =>
@@ -221,11 +331,7 @@ export const style = (options: ResponsiveStyleOptions): StyleHandle => {
     );
   }
 
-  const ctx: EmitStyleContext = {
-    breakpoints: config.breakpoints,
-    classPrefix: config.classPrefix,
-    breakpoint: config.breakpoint,
-  };
+  const ctx = getStyleConfig();
 
   const emitted = emitStyle(opts, ctx);
   const cached = styleCache.get(emitted.styleKey);

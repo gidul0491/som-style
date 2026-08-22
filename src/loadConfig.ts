@@ -85,7 +85,11 @@ export const loadSomStyleConfig = async (
   root: string,
   configFile?: string
 ): Promise<LoadedStyleConfig> => {
-  configure({ breakpoints: { pc: "1024px" }, breakpoint: "1024px" });
+  configure({
+    breakpoints: { pc: "1024px" },
+    breakpoint: "1024px",
+    cascadeLayers: false,
+  });
 
   const resolved = await resolveSomStyleConfigPath(root, configFile);
   if (resolved) {

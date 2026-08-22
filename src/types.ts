@@ -31,4 +31,14 @@ export type RxStyleConfig = {
   breakpoints?: Record<string, string>;
   /** Class name prefix. Default: "som" */
   classPrefix?: string;
+  /**
+   * Emit rules inside `@layer <prefix>.base` / `@layer <prefix>.<breakpoint>`
+   * and declare the layer order up front. Breakpoint precedence then no longer
+   * depends on the order rules land in the sheet. Default: false.
+   *
+   * Trade-off: layered CSS loses to *any* unlayered CSS regardless of
+   * specificity, so a plain reset or global stylesheet will start winning over
+   * som-style classes once this is on.
+   */
+  cascadeLayers?: boolean;
 };
